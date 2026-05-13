@@ -5598,12 +5598,19 @@ async function handleSAPDiagnose(client: AdtClient, args: Record<string, unknown
         sourceUrl = sourceUrlForType(type, name);
       }
 
+      const label1 =
+        String(args.label1 ?? '').trim() ||
+        (version1.startsWith('/sap/bc/adt/') ? `revision:${version1.split('/').pop()}` : version1);
+      const label2 =
+        String(args.label2 ?? '').trim() ||
+        (version2.startsWith('/sap/bc/adt/') ? `revision:${version2.split('/').pop()}` : version2);
+
       const result = await diffObjectVersions(client.http, client.safety, {
         sourceUrl,
         version1,
         version2,
-        label1: version1.startsWith('/sap/bc/adt/') ? `revision:${version1.split('/').pop()}` : version1,
-        label2: version2.startsWith('/sap/bc/adt/') ? `revision:${version2.split('/').pop()}` : version2,
+        label1,
+        label2,
       });
       return textResult(JSON.stringify(result, null, 2));
     }

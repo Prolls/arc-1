@@ -708,6 +708,10 @@ export const SAPDiagnoseSchema = z.object({
   version1: z.string().optional(),
   /** diff: second version — ADT revision URI or "active"/"inactive" */
   version2: z.string().optional(),
+  /** diff: human-readable label for version1 (e.g. "active" or "00008 - DNT-6-6 (DS7K900123)") */
+  label1: z.string().optional(),
+  /** diff: human-readable label for version2 */
+  label2: z.string().optional(),
   /** diff: for CLAS, which include to diff (main, definitions, implementations, macros, testclasses) */
   include: z.string().optional(),
   /** diff: function group name (required for FUNC) */

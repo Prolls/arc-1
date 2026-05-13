@@ -1189,6 +1189,15 @@ export function getToolDefinitions(
             description:
               'diff: second version to compare. Accepts "active", "inactive", or an ADT revision URI from SAPRead(type="VERSIONS") .revisions[].uri.',
           },
+          label1: {
+            type: 'string',
+            description:
+              'diff: human-readable label for version1, shown in the diff header. Recommended format: "<versionTitle> (<transport>)" e.g. "DNT-6-6: New Feature (DS7K900123)". Defaults to "active"/"inactive" or the revision URI tail.',
+          },
+          label2: {
+            type: 'string',
+            description: 'diff: human-readable label for version2. Same format as label1.',
+          },
           include: {
             type: 'string',
             description:
