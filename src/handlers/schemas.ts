@@ -681,6 +681,7 @@ export const SAPDiagnoseSchema = z.object({
     'object_state',
     'quickfix',
     'apply_quickfix',
+    'diff',
   ]),
   name: z.string().optional(),
   type: z.string().optional(),
@@ -703,6 +704,14 @@ export const SAPDiagnoseSchema = z.object({
   sections: z.array(z.string()).optional(),
   includeFullText: z.coerce.boolean().optional(),
   analysis: z.enum(['hitlist', 'statements', 'dbAccesses']).optional(),
+  /** diff: first version — ADT revision URI or "active"/"inactive" */
+  version1: z.string().optional(),
+  /** diff: second version — ADT revision URI or "active"/"inactive" */
+  version2: z.string().optional(),
+  /** diff: for CLAS, which include to diff (main, definitions, implementations, macros, testclasses) */
+  include: z.string().optional(),
+  /** diff: function group name (required for FUNC) */
+  group: z.string().optional(),
 });
 
 // ─── SAPTransport ───────────────────────────────────────────────────

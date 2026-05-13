@@ -1055,7 +1055,8 @@ export function getToolDefinitions(
         '- "dumps": List or read ABAP short dumps (ST22). Without id: lists recent dumps (filter by user, maxResults). With id: returns focused chapter sections by default; set includeFullText=true to include the full formatted dump blob. Optional sections=[kap0,kap3,...] to request specific chapter IDs.\n' +
         '- "traces": List or analyze ABAP profiler traces. Without id: lists trace files. With id + analysis: returns trace analysis (hitlist = hot spots, statements = call tree, dbAccesses = database access statistics).\n\n' +
         '- "system_messages": List SM02 system messages via ADT feed (filter by user, maxResults, from, to).\n' +
-        '- "gateway_errors": List SAP Gateway error log entries (/IWFND/ERROR_LOG, on-prem). For detail mode provide detailUrl (preferred) or id+errorType.\n\n' +
+        '- "gateway_errors": List SAP Gateway error log entries (/IWFND/ERROR_LOG, on-prem). For detail mode provide detailUrl (preferred) or id+errorType.\n' +
+        '- "diff": Compute a unified diff between two versions of an ABAP object source. Requires name + type + version1 + version2. version1/version2 accept: "active", "inactive", or an ADT revision URI from SAPRead(type="VERSIONS"). For CLAS, use include= to target a specific include (default: main). For FUNC, use group=. Returns unified diff text with added/removed line counts. To find which revision corresponds to a transport, first call SAPRead(type="VERSIONS") and match the transport field.\n\n' +
         'Quickfix workflow: run syntax/ATC first to identify issues and line positions, then call quickfix to retrieve SAP-verified proposals, then apply_quickfix to get exact text deltas, and finally write the updated source via SAPWrite.',
       inputSchema: {
         type: 'object',
@@ -1073,6 +1074,7 @@ export function getToolDefinitions(
               'object_state',
               'quickfix',
               'apply_quickfix',
+              'diff',
             ],
             description: 'Diagnostic action',
           },
@@ -1176,6 +1178,25 @@ export function getToolDefinitions(
             enum: ['hitlist', 'statements', 'dbAccesses'],
             description:
               'Trace analysis type (for traces action with id). hitlist = execution hot spots, statements = call tree, dbAccesses = database access stats.',
+          },
+          version1: {
+            type: 'string',
+            description:
+              'diff: first version to compare. Accepts "active", "inactive", or an ADT revision URI from SAPRead(type="VERSIONS") .revisions[].uri.',
+          },
+          version2: {
+            type: 'string',
+            description:
+              'diff: second version to compare. Accepts "active", "inactive", or an ADT revision URI from SAPRead(type="VERSIONS") .revisions[].uri.',
+          },
+          include: {
+            type: 'string',
+            description:
+              'diff: for CLAS only — which include to diff (main, definitions, implementations, macros, testclasses). Default: main.',
+          },
+          group: {
+            type: 'string',
+            description: 'diff: function group name — required when type=FUNC.',
           },
         },
         required: ['action'],

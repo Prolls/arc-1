@@ -3,6 +3,7 @@
  *
  * - Short dumps (ST22): list and read ABAP runtime errors
  * - ABAP traces: list and analyze profiler trace files
+ * - Source diff: client-side unified diff between two revision sources
  *
  * All operations are read-only (GET requests).
  * Follows the same pure-function pattern as devtools.ts.
@@ -32,6 +33,259 @@ import type {
   TraceStatement,
 } from './types.js';
 import { findDeepNodes, parseXml } from './xml-parser.js';
+
+// ─── Source Diff ────────────────────────────────────────────────────
+
+export interface DiffOptions {
+  /** ADT path or "active"/"inactive" */
+  version1: string;
+  /** ADT path or "active"/"inactive" */
+  version2: string;
+  /** Base source URL for the object (e.g. /sap/bc/adt/programs/programs/ZPROG/source/main) */
+  sourceUrl: string;
+  /** Human-readable label for version1 (defaults to version1 value) */
+  label1?: string;
+  /** Human-readable label for version2 (defaults to version2 value) */
+  label2?: string;
+}
+
+export interface DiffResult {
+  label1: string;
+  label2: string;
+  /** Unified diff text (empty string when sources are identical) */
+  diff: string;
+  identical: boolean;
+  /** Lines added in version2 relative to version1 */
+  addedLines: number;
+  /** Lines removed from version1 */
+  removedLines: number;
+}
+
+/**
+ * Compute a unified diff between two versions of an ABAP object source.
+ *
+ * Both versions are fetched in parallel. "active" and "inactive" are resolved
+ * via the ?version= query param on the source URL; explicit ADT URIs are
+ * fetched directly (as returned by SAPRead type=VERSIONS .revisions[].uri).
+ *
+ * ADT has no server-side diff endpoint — the diff is computed client-side.
+ */
+export async function diffObjectVersions(
+  http: AdtHttpClient,
+  safety: SafetyConfig,
+  options: DiffOptions,
+): Promise<DiffResult> {
+  checkOperation(safety, OperationType.Read, 'DiffObjectVersions');
+
+  const [src1, src2] = await Promise.all([
+    fetchVersionSource(http, options.sourceUrl, options.version1),
+    fetchVersionSource(http, options.sourceUrl, options.version2),
+  ]);
+
+  const label1 = options.label1 ?? options.version1;
+  const label2 = options.label2 ?? options.version2;
+
+  if (src1 === src2) {
+    return { label1, label2, diff: '', identical: true, addedLines: 0, removedLines: 0 };
+  }
+
+  const { diff, addedLines, removedLines } = computeUnifiedDiff(src1, src2, label1, label2);
+  return { label1, label2, diff, identical: false, addedLines, removedLines };
+}
+
+async function fetchVersionSource(http: AdtHttpClient, sourceUrl: string, version: string): Promise<string> {
+  // Explicit ADT URI (from VERSIONS feed) — fetch directly
+  if (version.startsWith('/sap/bc/adt/')) {
+    const resp = await http.get(version, { Accept: 'text/plain' });
+    return resp.body;
+  }
+  // "active" or "inactive" — append ?version= to the source URL
+  const url = appendQueryParam(sourceUrl, 'version', version);
+  const resp = await http.get(url, { Accept: 'text/plain, */*;q=0.8' });
+  return resp.body;
+}
+
+/**
+ * Generate a unified diff between two source strings.
+ * Pure function — no external dependencies.
+ */
+export function computeUnifiedDiff(
+  source1: string,
+  source2: string,
+  label1: string,
+  label2: string,
+  contextLines = 3,
+): { diff: string; addedLines: number; removedLines: number } {
+  const lines1 = source1.split('\n');
+  const lines2 = source2.split('\n');
+
+  const lcs = computeLcs(lines1, lines2);
+  const hunks = buildHunks(lines1, lines2, lcs, contextLines);
+
+  if (hunks.length === 0) {
+    return { diff: '', addedLines: 0, removedLines: 0 };
+  }
+
+  let addedLines = 0;
+  let removedLines = 0;
+  const parts: string[] = [`--- ${label1}`, `+++ ${label2}`];
+
+  for (const hunk of hunks) {
+    const oldStart = hunk.oldStart + 1;
+    const newStart = hunk.newStart + 1;
+    parts.push(`@@ -${oldStart},${hunk.oldCount} +${newStart},${hunk.newCount} @@`);
+    for (const line of hunk.lines) {
+      parts.push(line);
+      if (line.startsWith('+')) addedLines++;
+      else if (line.startsWith('-')) removedLines++;
+    }
+  }
+
+  return { diff: parts.join('\n'), addedLines, removedLines };
+}
+
+interface Hunk {
+  oldStart: number;
+  oldCount: number;
+  newStart: number;
+  newCount: number;
+  lines: string[];
+}
+
+/**
+ * Myers-style LCS via dynamic programming.
+ * Returns an array of [i, j] pairs where lines1[i] === lines2[j].
+ */
+function computeLcs(lines1: string[], lines2: string[]): Array<[number, number]> {
+  const m = lines1.length;
+  const n = lines2.length;
+
+  // dp[i][j] = length of LCS of lines1[0..i-1] and lines2[0..j-1]
+  const dp: number[][] = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(0));
+
+  for (let i = 1; i <= m; i++) {
+    for (let j = 1; j <= n; j++) {
+      if (lines1[i - 1] === lines2[j - 1]) {
+        dp[i]![j] = dp[i - 1]![j - 1]! + 1;
+      } else {
+        dp[i]![j] = Math.max(dp[i - 1]![j]!, dp[i]![j - 1]!);
+      }
+    }
+  }
+
+  // Backtrack to find the actual matching pairs
+  const matches: Array<[number, number]> = [];
+  let i = m;
+  let j = n;
+  while (i > 0 && j > 0) {
+    if (lines1[i - 1] === lines2[j - 1]) {
+      matches.push([i - 1, j - 1]);
+      i--;
+      j--;
+    } else if (dp[i - 1]![j]! >= dp[i]![j - 1]!) {
+      i--;
+    } else {
+      j--;
+    }
+  }
+  return matches.reverse();
+}
+
+function buildHunks(lines1: string[], lines2: string[], lcs: Array<[number, number]>, contextLines: number): Hunk[] {
+  // Build a flat edit list: context / removed / added
+  interface Edit {
+    type: 'context' | 'removed' | 'added';
+    i: number; // index in lines1 (for context/removed)
+    j: number; // index in lines2 (for context/added)
+    text: string;
+  }
+
+  const edits: Edit[] = [];
+  let i1 = 0;
+  let i2 = 0;
+
+  for (const [li, lj] of lcs) {
+    while (i1 < li) {
+      edits.push({ type: 'removed', i: i1, j: -1, text: lines1[i1]! });
+      i1++;
+    }
+    while (i2 < lj) {
+      edits.push({ type: 'added', i: -1, j: i2, text: lines2[i2]! });
+      i2++;
+    }
+    edits.push({ type: 'context', i: i1, j: i2, text: lines1[i1]! });
+    i1++;
+    i2++;
+  }
+  while (i1 < lines1.length) {
+    edits.push({ type: 'removed', i: i1, j: -1, text: lines1[i1]! });
+    i1++;
+  }
+  while (i2 < lines2.length) {
+    edits.push({ type: 'added', i: -1, j: i2, text: lines2[i2]! });
+    i2++;
+  }
+
+  // Group edits into hunks with context
+  const hunks: Hunk[] = [];
+  const changeIndices = edits.map((e, idx) => (e.type !== 'context' ? idx : -1)).filter((idx) => idx >= 0);
+
+  if (changeIndices.length === 0) return [];
+
+  // Merge nearby changes into a single hunk window
+  const windows: Array<[number, number]> = [];
+  let start = Math.max(0, changeIndices[0]! - contextLines);
+  let end = Math.min(edits.length - 1, changeIndices[0]! + contextLines);
+
+  for (let k = 1; k < changeIndices.length; k++) {
+    const nextStart = Math.max(0, changeIndices[k]! - contextLines);
+    if (nextStart <= end + 1) {
+      end = Math.min(edits.length - 1, changeIndices[k]! + contextLines);
+    } else {
+      windows.push([start, end]);
+      start = nextStart;
+      end = Math.min(edits.length - 1, changeIndices[k]! + contextLines);
+    }
+  }
+  windows.push([start, end]);
+
+  for (const [ws, we] of windows) {
+    const slice = edits.slice(ws, we + 1);
+    const hunkLines: string[] = [];
+    let oldCount = 0;
+    let newCount = 0;
+    let oldStart = -1;
+    let newStart = -1;
+
+    for (const edit of slice) {
+      if (edit.type === 'context') {
+        if (oldStart < 0) oldStart = edit.i;
+        if (newStart < 0) newStart = edit.j;
+        hunkLines.push(` ${edit.text}`);
+        oldCount++;
+        newCount++;
+      } else if (edit.type === 'removed') {
+        if (oldStart < 0) oldStart = edit.i;
+        hunkLines.push(`-${edit.text}`);
+        oldCount++;
+      } else {
+        if (newStart < 0) newStart = edit.j;
+        hunkLines.push(`+${edit.text}`);
+        newCount++;
+      }
+    }
+
+    hunks.push({
+      oldStart: oldStart < 0 ? 0 : oldStart,
+      oldCount,
+      newStart: newStart < 0 ? 0 : newStart,
+      newCount,
+      lines: hunkLines,
+    });
+  }
+
+  return hunks;
+}
 
 // ─── Short Dumps ────────────────────────────────────────────────────
 

@@ -2,7 +2,9 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import {
+  computeUnifiedDiff,
   decodeHtmlEntities,
+  diffObjectVersions,
   getDump,
   getGatewayErrorDetail,
   getObjectState,
@@ -1093,5 +1095,149 @@ describe('Runtime Diagnostics', () => {
       expect(decodeHtmlEntities(undefined as unknown as string)).toBe('');
       expect(decodeHtmlEntities('')).toBe('');
     });
+  });
+});
+
+// ─── computeUnifiedDiff ─────────────────────────────────────────────
+
+describe('computeUnifiedDiff', () => {
+  it('returns empty diff for identical sources', () => {
+    const src = 'line1\nline2\nline3';
+    const { diff, addedLines, removedLines } = computeUnifiedDiff(src, src, 'v1', 'v2');
+    expect(diff).toBe('');
+    expect(addedLines).toBe(0);
+    expect(removedLines).toBe(0);
+  });
+
+  it('produces correct diff header labels', () => {
+    const { diff } = computeUnifiedDiff('a\n', 'b\n', 'active', 'inactive');
+    expect(diff).toContain('--- active');
+    expect(diff).toContain('+++ inactive');
+  });
+
+  it('detects added lines', () => {
+    const src1 = 'line1\nline2';
+    const src2 = 'line1\nline2\nline3';
+    const { diff, addedLines, removedLines } = computeUnifiedDiff(src1, src2, 'v1', 'v2');
+    expect(addedLines).toBe(1);
+    expect(removedLines).toBe(0);
+    expect(diff).toContain('+line3');
+  });
+
+  it('detects removed lines', () => {
+    const src1 = 'line1\nline2\nline3';
+    const src2 = 'line1\nline3';
+    const { diff, addedLines, removedLines } = computeUnifiedDiff(src1, src2, 'v1', 'v2');
+    expect(removedLines).toBe(1);
+    expect(addedLines).toBe(0);
+    expect(diff).toContain('-line2');
+  });
+
+  it('detects modified lines as remove+add', () => {
+    const src1 = 'lv_total = iv_price * iv_qty.';
+    const src2 = 'lv_total = iv_price * iv_qty * ( 1 - iv_discount ).';
+    const { addedLines, removedLines } = computeUnifiedDiff(src1, src2, 'v1', 'v2');
+    expect(addedLines).toBe(1);
+    expect(removedLines).toBe(1);
+  });
+
+  it('includes context lines around changes', () => {
+    const lines = Array.from({ length: 10 }, (_, i) => `line${i + 1}`);
+    const src1 = lines.join('\n');
+    const src2 = [...lines.slice(0, 5), 'changed', ...lines.slice(6)].join('\n');
+    const { diff } = computeUnifiedDiff(src1, src2, 'v1', 'v2');
+    // Context lines appear with a space prefix
+    expect(diff).toContain(' line5');
+    expect(diff).toContain(' line7');
+    expect(diff).toContain('-line6');
+    expect(diff).toContain('+changed');
+  });
+
+  it('produces valid hunk header format', () => {
+    const { diff } = computeUnifiedDiff('a\nb\nc', 'a\nx\nc', 'v1', 'v2');
+    expect(diff).toMatch(/^@@ -\d+,\d+ \+\d+,\d+ @@$/m);
+  });
+
+  it('handles empty source1', () => {
+    const { diff, addedLines } = computeUnifiedDiff('', 'new line', 'v1', 'v2');
+    expect(addedLines).toBeGreaterThan(0);
+    expect(diff).toContain('+new line');
+  });
+
+  it('handles empty source2', () => {
+    const { diff, removedLines } = computeUnifiedDiff('old line', '', 'v1', 'v2');
+    expect(removedLines).toBeGreaterThan(0);
+    expect(diff).toContain('-old line');
+  });
+});
+
+// ─── diffObjectVersions ────────────────────────────────────────────
+
+describe('diffObjectVersions', () => {
+  const safety = unrestrictedSafetyConfig();
+
+  it('fetches active and inactive versions via ?version= param', async () => {
+    const mockFetch = vi.fn();
+    mockFetch
+      .mockResolvedValueOnce({ statusCode: 200, body: 'line1\nline2', headers: {} })
+      .mockResolvedValueOnce({ statusCode: 200, body: 'line1\nline2\nline3', headers: {} });
+
+    const http = {
+      get: mockFetch,
+    } as unknown as AdtHttpClient;
+
+    const result = await diffObjectVersions(http, safety, {
+      sourceUrl: '/sap/bc/adt/programs/programs/ZPROG/source/main',
+      version1: 'active',
+      version2: 'inactive',
+    });
+
+    expect(mockFetch).toHaveBeenCalledWith(
+      '/sap/bc/adt/programs/programs/ZPROG/source/main?version=active',
+      expect.any(Object),
+    );
+    expect(mockFetch).toHaveBeenCalledWith(
+      '/sap/bc/adt/programs/programs/ZPROG/source/main?version=inactive',
+      expect.any(Object),
+    );
+    expect(result.identical).toBe(false);
+    expect(result.addedLines).toBe(1);
+    expect(result.removedLines).toBe(0);
+  });
+
+  it('fetches explicit ADT revision URIs directly', async () => {
+    const mockFetch = vi.fn();
+    mockFetch
+      .mockResolvedValueOnce({ statusCode: 200, body: 'old source', headers: {} })
+      .mockResolvedValueOnce({ statusCode: 200, body: 'new source', headers: {} });
+
+    const http = { get: mockFetch } as unknown as AdtHttpClient;
+    const uri1 = '/sap/bc/adt/programs/programs/ZPROG/source/main/versions/000001';
+    const uri2 = '/sap/bc/adt/programs/programs/ZPROG/source/main/versions/000002';
+
+    await diffObjectVersions(http, safety, {
+      sourceUrl: '/sap/bc/adt/programs/programs/ZPROG/source/main',
+      version1: uri1,
+      version2: uri2,
+    });
+
+    expect(mockFetch).toHaveBeenCalledWith(uri1, expect.any(Object));
+    expect(mockFetch).toHaveBeenCalledWith(uri2, expect.any(Object));
+  });
+
+  it('returns identical=true when both versions have the same content', async () => {
+    const mockFetch = vi.fn().mockResolvedValue({ statusCode: 200, body: 'same source', headers: {} });
+    const http = { get: mockFetch } as unknown as AdtHttpClient;
+
+    const result = await diffObjectVersions(http, safety, {
+      sourceUrl: '/sap/bc/adt/programs/programs/ZPROG/source/main',
+      version1: 'active',
+      version2: 'inactive',
+    });
+
+    expect(result.identical).toBe(true);
+    expect(result.diff).toBe('');
+    expect(result.addedLines).toBe(0);
+    expect(result.removedLines).toBe(0);
   });
 });

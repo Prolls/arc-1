@@ -84,6 +84,7 @@ import {
   unpublishServiceBinding,
 } from '../adt/devtools.js';
 import {
+  diffObjectVersions,
   getDump,
   getGatewayErrorDetail,
   getObjectState,
@@ -5559,6 +5560,51 @@ async function handleSAPDiagnose(client: AdtClient, args: Record<string, unknown
           : [{ section: 'main', uri: sourceUrlForType(type, name) }];
 
       const result = await getObjectState(client.http, client.safety, { type, name, sections });
+      return textResult(JSON.stringify(result, null, 2));
+    }
+    case 'diff': {
+      if (!name || !type) return errorResult('"name" and "type" are required for "diff" action.');
+      const version1 = String(args.version1 ?? '').trim();
+      const version2 = String(args.version2 ?? '').trim();
+      if (!version1)
+        return errorResult(
+          '"version1" is required for "diff" action. Use "active", "inactive", or an ADT revision URI from SAPRead(type="VERSIONS").',
+        );
+      if (!version2)
+        return errorResult(
+          '"version2" is required for "diff" action. Use "active", "inactive", or an ADT revision URI from SAPRead(type="VERSIONS").',
+        );
+
+      let sourceUrl: string;
+      if (type === 'CLAS') {
+        const include = String(args.include ?? 'main')
+          .trim()
+          .toLowerCase();
+        const validIncludes = new Set(['main', 'definitions', 'implementations', 'macros', 'testclasses']);
+        if (!validIncludes.has(include)) {
+          return errorResult(
+            `Invalid include "${include}" for CLAS diff. Valid values: main, definitions, implementations, macros, testclasses.`,
+          );
+        }
+        sourceUrl =
+          include === 'main'
+            ? sourceUrlForType(type, name)
+            : `${classIncludeUrl(name, include as 'definitions' | 'implementations' | 'macros' | 'testclasses')}/source/main`;
+      } else if (type === 'FUNC') {
+        const group = String(args.group ?? '').trim();
+        if (!group) return errorResult('"group" (function group name) is required for FUNC diff.');
+        sourceUrl = `/sap/bc/adt/functions/groups/${encodeURIComponent(group)}/fmodules/${encodeURIComponent(name)}/source/main`;
+      } else {
+        sourceUrl = sourceUrlForType(type, name);
+      }
+
+      const result = await diffObjectVersions(client.http, client.safety, {
+        sourceUrl,
+        version1,
+        version2,
+        label1: version1.startsWith('/sap/bc/adt/') ? `revision:${version1.split('/').pop()}` : version1,
+        label2: version2.startsWith('/sap/bc/adt/') ? `revision:${version2.split('/').pop()}` : version2,
+      });
       return textResult(JSON.stringify(result, null, 2));
     }
     case 'quickfix': {
