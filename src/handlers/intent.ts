@@ -68,6 +68,23 @@ import {
   type ServiceBindingCreateParams,
 } from '../adt/ddic-xml.js';
 import {
+  type DebugBreakpointSpec,
+  type DebuggerScope,
+  type DebuggingMode,
+  type DebugStepType,
+  debuggerAttach,
+  debuggerChildVariables,
+  debuggerDeleteBreakpoint,
+  debuggerDeleteListener,
+  debuggerListen,
+  debuggerListenerStatus,
+  debuggerSetBreakpoints,
+  debuggerSetVariableValue,
+  debuggerStack,
+  debuggerStep,
+  debuggerVariables,
+} from '../adt/debugger.js';
+import {
   type ActivationResult,
   activate,
   activateBatch,
@@ -1196,6 +1213,9 @@ export async function handleToolCall(
           break;
         case 'SAPManage':
           result = await handleSAPManage(client, config, args, cachingLayer, isPerUserClient);
+          break;
+        case 'SAPDebug':
+          result = await handleSAPDebug(client, args);
           break;
         case 'SAP': {
           // Hyperfocused mode: route to the appropriate handler
@@ -2810,19 +2830,21 @@ export function buildCreateXml(
                adtcore:responsible="DEVELOPER">
   <adtcore:packageRef adtcore:name="${escapeXml(pkg)}"/>
 </dcl:dclSource>`;
-    case 'TABL':
-      // TABL creation also uses SAP's "blue" framework envelope, then source is written via /source/main.
+    case 'TABL': {
+      // CDS structure extensions (extend type …) are TABL/DS; transparent tables are TABL/DT.
+      const tablSubtype = properties?.isCdsExtension ? 'TABL/DS' : 'TABL/DT';
       return `<?xml version="1.0" encoding="UTF-8"?>
 <blue:blueSource xmlns:blue="http://www.sap.com/wbobj/blue"
                  xmlns:adtcore="http://www.sap.com/adt/core"
                  adtcore:description="${escapeXml(description)}"
                  adtcore:name="${escapeXml(name)}"
-                 adtcore:type="TABL/DT"
+                 adtcore:type="${tablSubtype}"
                  adtcore:masterLanguage="EN"
                  adtcore:masterSystem="H00"
                  adtcore:responsible="DEVELOPER">
   <adtcore:packageRef adtcore:name="${escapeXml(pkg)}"/>
 </blue:blueSource>`;
+    }
     case 'BDEF':
       // BDEF uses SAP's "blue" framework — blue:blueSource with http://www.sap.com/wbobj/blue namespace.
       // Confirmed by vibing-steampunk (Go) and fr0ster (TypeScript) reference implementations.
@@ -3855,6 +3877,9 @@ async function handleSAPWrite(
       // SAP ADT requires the root element to match the object type —
       // a generic objectReferences body returns 400 "System expected the element ...".
       const metadataProperties = getMetadataWriteProperties(args);
+      if (type === 'TABL' && /extend\s+type\b/i.test(source)) {
+        metadataProperties.isCdsExtension = true;
+      }
       const body = buildCreateXml(type, name, pkg, description, metadataProperties);
 
       // Step 1: Create the object (metadata only)
@@ -7041,4 +7066,156 @@ export function setCachedDiscovery(map: Map<string, string[]>): void {
 /** Get startup-cached ADT discovery MIME map. */
 export function getCachedDiscovery(): Map<string, string[]> {
   return cachedDiscovery;
+}
+
+async function handleSAPDebug(client: AdtClient, args: Record<string, unknown>): Promise<ToolResult> {
+  if (!client.safety.allowDebug) {
+    return errorResult('SAPDebug is disabled. Set SAP_ALLOW_DEBUG=true to enable runtime debugging.');
+  }
+
+  const action = String(args.action ?? '');
+  const debuggingMode = (args.debuggingMode as DebuggingMode | undefined) ?? 'user';
+  const terminalId = (args.terminalId as string | undefined) ?? '';
+  const ideId = (args.ideId as string | undefined) ?? '';
+  const requestUser = args.requestUser as string | undefined;
+
+  const requireListenerIds = (): string | undefined => {
+    if (!terminalId) return '"terminalId" is required.';
+    if (!ideId) return '"ideId" is required.';
+    return undefined;
+  };
+
+  switch (action) {
+    case 'listener_status': {
+      const err = requireListenerIds();
+      if (err) return errorResult(err);
+      const status = await debuggerListenerStatus(client.http, {
+        debuggingMode,
+        terminalId,
+        ideId,
+        requestUser,
+        checkConflict: args.checkConflict as boolean | undefined,
+      });
+      return textResult(JSON.stringify(status, null, 2));
+    }
+    case 'listen': {
+      checkOperation(client.safety, OperationType.Update, 'SAPDebug.listen');
+      const err = requireListenerIds();
+      if (err) return errorResult(err);
+      const debuggee = await debuggerListen(client.http, {
+        debuggingMode,
+        terminalId,
+        ideId,
+        requestUser,
+        checkConflict: args.checkConflict as boolean | undefined,
+        isNotifiedOnConflict: args.isNotifiedOnConflict as boolean | undefined,
+        timeoutMs: args.timeoutMs as number | undefined,
+      });
+      if (!debuggee) return textResult('Listener returned empty body — no debuggee captured.');
+      return textResult(JSON.stringify(debuggee, null, 2));
+    }
+    case 'delete_listener': {
+      checkOperation(client.safety, OperationType.Delete, 'SAPDebug.delete_listener');
+      const err = requireListenerIds();
+      if (err) return errorResult(err);
+      await debuggerDeleteListener(client.http, { debuggingMode, terminalId, ideId, requestUser });
+      return textResult('Listener deleted.');
+    }
+    case 'set_breakpoints': {
+      checkOperation(client.safety, OperationType.Update, 'SAPDebug.set_breakpoints');
+      const err = requireListenerIds();
+      if (err) return errorResult(err);
+      const clientId = String(args.clientId ?? '');
+      if (!clientId) return errorResult('"clientId" is required for set_breakpoints.');
+      const raw = args.breakpoints;
+      if (!Array.isArray(raw))
+        return errorResult('"breakpoints" must be an array (may be empty to clear all breakpoints for this terminal).');
+      const breakpoints: DebugBreakpointSpec[] = raw.map((b) => {
+        if (typeof b === 'string') return { uri: b };
+        const obj = b as Record<string, unknown>;
+        const uri = String(obj.uri ?? '');
+        const line = obj.line as number | undefined;
+        return {
+          uri: line !== undefined && !uri.includes('#') ? `${uri}#start=${line}` : uri,
+          kind: obj.kind as string | undefined,
+          condition: obj.condition as string | undefined,
+        };
+      });
+      const result = await debuggerSetBreakpoints(client.http, {
+        debuggingMode,
+        terminalId,
+        ideId,
+        clientId,
+        breakpoints,
+        requestUser,
+        scope: args.scope as DebuggerScope | undefined,
+        systemDebugging: args.systemDebugging as boolean | undefined,
+        deactivated: args.deactivated as boolean | undefined,
+        syncScopeUri: args.syncScopeUri as string | undefined,
+      });
+      return textResult(JSON.stringify(result, null, 2));
+    }
+    case 'delete_breakpoint': {
+      checkOperation(client.safety, OperationType.Delete, 'SAPDebug.delete_breakpoint');
+      const err = requireListenerIds();
+      if (err) return errorResult(err);
+      const breakpointId = String(args.breakpointId ?? '');
+      if (!breakpointId) return errorResult('"breakpointId" is required for delete_breakpoint.');
+      await debuggerDeleteBreakpoint(client.http, {
+        breakpointId,
+        debuggingMode,
+        terminalId,
+        ideId,
+        requestUser,
+        scope: args.scope as DebuggerScope | undefined,
+      });
+      return textResult(`Breakpoint ${breakpointId} deleted.`);
+    }
+    case 'attach': {
+      checkOperation(client.safety, OperationType.Update, 'SAPDebug.attach');
+      const debuggeeId = String(args.debuggeeId ?? '');
+      if (!debuggeeId) return errorResult('"debuggeeId" is required for attach.');
+      const result = await debuggerAttach(client.http, {
+        debuggingMode,
+        debuggeeId,
+        requestUser,
+        dynproDebugging: args.dynproDebugging as boolean | undefined,
+      });
+      return textResult(JSON.stringify(result, null, 2));
+    }
+    case 'stack': {
+      const semanticURIs = args.semanticURIs === undefined ? true : Boolean(args.semanticURIs);
+      const stack = await debuggerStack(client.http, semanticURIs);
+      return textResult(JSON.stringify(stack, null, 2));
+    }
+    case 'variables': {
+      const ids = args.ids;
+      if (!Array.isArray(ids) || ids.length === 0)
+        return errorResult('"ids" must be a non-empty array of variable IDs.');
+      const vars = await debuggerVariables(client.http, ids.map(String));
+      return textResult(JSON.stringify(vars, null, 2));
+    }
+    case 'child_variables': {
+      const parents = Array.isArray(args.parents) ? args.parents.map(String) : undefined;
+      const result = await debuggerChildVariables(client.http, parents);
+      return textResult(JSON.stringify(result, null, 2));
+    }
+    case 'step': {
+      checkOperation(client.safety, OperationType.Update, 'SAPDebug.step');
+      const step = String(args.step ?? '') as DebugStepType;
+      if (!step) return errorResult('"step" is required for step action.');
+      const result = await debuggerStep(client.http, step, args.stepUri as string | undefined);
+      return textResult(JSON.stringify(result, null, 2));
+    }
+    case 'set_variable_value': {
+      checkOperation(client.safety, OperationType.Update, 'SAPDebug.set_variable_value');
+      const variableName = String(args.variableName ?? '');
+      const value = String(args.value ?? '');
+      if (!variableName) return errorResult('"variableName" is required for set_variable_value.');
+      const body = await debuggerSetVariableValue(client.http, variableName, value);
+      return textResult(body || 'OK');
+    }
+    default:
+      return errorResult(`Unknown SAPDebug action: ${action}`);
+  }
 }
