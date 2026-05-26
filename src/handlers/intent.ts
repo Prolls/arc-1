@@ -3456,7 +3456,12 @@ async function handleSAPWrite(
   // `buildCreateXml('FUNC', …, properties)` finds it.
   let objectUrl: string;
   let srcUrl: string;
-  if (type === 'TABL' && action !== 'create' && action !== 'batch_create') {
+  if (type === 'TABL' && action === 'create' && /extend\s+type\b/i.test(source)) {
+    // CDS structure extension (extend type …) — must POST to /structures/, not /tables/.
+    // /tables/ rejects names longer than 16 chars and would set TABCLASS=INTTAB.
+    objectUrl = `/sap/bc/adt/ddic/structures/${encodeURIComponent(name)}`;
+    srcUrl = `${objectUrl}/source/main`;
+  } else if (type === 'TABL' && action !== 'create' && action !== 'batch_create') {
     // Write/activate/delete: ask SAP for the actual subtype (TABL/DT vs TABL/DS)
     // and refuse transparent-table writes on systems that don't expose
     // /sap/bc/adt/ddic/tables/. Read-path resolveTablObjectUrl() would silently
